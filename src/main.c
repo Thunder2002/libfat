@@ -13,8 +13,8 @@ typedef enum {
 
 char *error_desc[] = {
 	[E_SUCCESS] = "No error",
-    [E_ERROR] = "Error",
-    [E_INVALID_MBR_SIG] = "Invalid MBR signature"
+	[E_ERROR] = "Error",
+	[E_INVALID_MBR_SIG] = "Invalid MBR signature"
 };
 
 #endif 
@@ -38,16 +38,16 @@ typedef enum {
 
 char *part_type_desc[] = {
 	[PART_TYPE_EMPTY] = "Empty",
-    [PART_TYPE_FAT12] = "FAT12",
-    [PART_TYPE_FAT16_32] = "FAT16 <= 32MiB",
-    [PART_TYPE_EXTENDED] = "Extended",
-    [PART_TYPE_FAT16] = "FAT16",
-    [PART_TYPE_NTFS] = "NTFS",
-    [PART_TYPE_FAT32] = "FAT32",
-    [PART_TYPE_FAT32_LBA] = "FAT32 LBA",
-    [PART_TYPE_DYNAMIC] = "Dynamic",
-    [PART_TYPE_LINUX_SWAP] = "Linux SWAP",
-    [PART_TYPE_LINUX_LVM] = "Linux LVM"
+	[PART_TYPE_FAT12] = "FAT12",
+	[PART_TYPE_FAT16_32] = "FAT16 <= 32MiB",
+	[PART_TYPE_EXTENDED] = "Extended",
+	[PART_TYPE_FAT16] = "FAT16",
+	[PART_TYPE_NTFS] = "NTFS",
+	[PART_TYPE_FAT32] = "FAT32",
+	[PART_TYPE_FAT32_LBA] = "FAT32 LBA",
+	[PART_TYPE_DYNAMIC] = "Dynamic",
+	[PART_TYPE_LINUX_SWAP] = "Linux SWAP",
+	[PART_TYPE_LINUX_LVM] = "Linux LVM"
 };
 
 #endif 
@@ -57,6 +57,8 @@ char *part_type_desc[] = {
 #define PARTS_TBL_OFFSET 446
 #define PARTS_ENTRY_LEN 16
 #define FAT_ENTRY_LEN 32
+#define FAT_ENTRY_NAME_LEN 8
+#define FAT_ENTRY_EXT_LEN 3
 
 typedef char uint8_t;
 typedef unsigned short uint16_t;
@@ -89,6 +91,18 @@ typedef struct {
 	uint32_t cluster; // 2
 	uint32_t size; // 4
 } fat_entry_t; // 26
+
+error_t io_read_block(char *buffer, uint32_t offset, uint32_t len);
+error_t io_read_sector(char *buffer, uint32_t offset);
+uint16_t io_parse_uint16(char *buffer, uint16_t offset);
+uint32_t io_parse_uint32(char *buffer, uint16_t offset);
+error_t mbr_parse(char *buffer, part_t parts[]);
+error_t fat_read_sector0(char *buffer, part_t *part, fat_t *fat);
+error_t fat_read_entries(char *buffer, part_t *part, fat_t *fat, fat_entry_t *entry);
+void debug_print_buffer(char *buffer, uint32_t len);
+void debug_print_part(part_t *part);
+void debug_print_fat(fat_t *fat);
+void debug_print_fat_entry(fat_entry_t *entry);
 
 error_t io_read_block(char *buffer, uint32_t offset, uint32_t len) {
 	FILE *file;
@@ -157,7 +171,7 @@ error_t mbr_parse(char *buffer, part_t parts[]) {
 	return E_SUCCESS;
 }
 
-error_t fat_read(char *buffer, part_t *part, fat_t *fat) {
+error_t fat_read_sector0(char *buffer, part_t *part, fat_t *fat) {
 	io_read_sector(buffer, part->start);
 
 	fat->bytesPerSector = io_parse_uint16(buffer, 0x0B);
@@ -179,8 +193,50 @@ error_t fat_read(char *buffer, part_t *part, fat_t *fat) {
 	return E_SUCCESS;
 }
 
-error_t fat_entry(char *buffer, fat_entry_t *entry) {
+error_t fat_read_entries(char *buffer, part_t *part, fat_t *fat, fat_entry_t *entry) {
+	uint32_t fatTblOffset = (fat->bytesPerSector * fat->reservedSectors);
+	uint32_t fatDataOffset = fatTblOffset + (fat->totalFATs * fat->sectorsPerFAT * fat->bytesPerSector);
+	// Should work due to specs but doesn't, maybe because of FAT16 + VFAT for LFN
+	/*if (part->type == PART_TYPE_FAT16) {
+		fatDataOffset += (fat->maxRootEntries * FAT_ENTRY_LEN) / fat->bytesPerSector;
+	}*/
 
+	uint8_t i, j;
+	uint32_t offset = 0;
+	uint16_t bufferOffset;
+	bool terminate = false;
+	do {
+		io_read_sector(buffer, part->start + ((fatDataOffset + offset) / SECTOR_LEN));
+		//debug_print_buffer(buffer, SECTOR_LEN);
+
+		bufferOffset = 0;
+		for (i = 0; i < 16 && !terminate; ++i) {
+			// Skip long file name entries
+			if (buffer[bufferOffset + 0x0B] == 0x0F && buffer[bufferOffset + 0x1A] == 0) {
+				bufferOffset += FAT_ENTRY_LEN;
+				continue;
+			}
+
+			// Terminate on null entry
+			if (buffer[bufferOffset + 0x1A] == 0) {
+				terminate = true;
+				continue;
+			}
+
+			for (j = 0; j < FAT_ENTRY_NAME_LEN; ++j) {
+				entry->name[j] = buffer[bufferOffset + 0x00 + j];
+			}
+			for (j = 0; j < FAT_ENTRY_EXT_LEN; ++j) {
+				entry->ext[j] = buffer[bufferOffset + 0x08 + j];	
+			}
+
+			bufferOffset += FAT_ENTRY_LEN;
+
+			debug_print_fat_entry(entry);
+		}
+
+		offset += fat->bytesPerSector;
+	} while (!terminate);
 }
 
 void debug_print_buffer(char *buffer, uint32_t len) {
@@ -216,31 +272,36 @@ void debug_print_fat(fat_t *fat) {
 	printf("Total sectors: %d\n", fat->totalSectors);
 }
 
+void debug_print_fat_entry(fat_entry_t *entry) {
+	uint8_t i;
+	printf("Name: ");
+	for (i = 0; i < FAT_ENTRY_NAME_LEN; ++i) {
+		putchar(entry->name[i]);
+	}
+	putchar('.');
+	for (i = 0; i < FAT_ENTRY_EXT_LEN; ++i) {
+		putchar(entry->ext[i]);
+	}
+	putchar('\n');
+}
+
 int main(void) {	
 	int i;	
 
 	char buffer[SECTOR_LEN];
 	if (io_read_sector(buffer, 0) == E_SUCCESS) {
-		debug_print_buffer(buffer, SECTOR_LEN);
+		//debug_print_buffer(buffer, SECTOR_LEN);
 		part_t parts[PARTS_MAX];
 		if (mbr_parse(buffer, parts) == E_SUCCESS) {		
 			debug_print_part(&parts[0]);
 
 			fat_t fat;
-			fat_read(buffer, &parts[0], &fat);
-			debug_print_buffer(buffer, SECTOR_LEN);
+			fat_read_sector0(buffer, &parts[0], &fat);
+			//debug_print_buffer(buffer, SECTOR_LEN);
 			debug_print_fat(&fat);
 
-			uint32_t fatTblOffset = (fat.bytesPerSector * fat.reservedSectors);
-			io_read_sector(buffer, parts[0].start + (fatTblOffset / SECTOR_LEN));
-			debug_print_buffer(buffer, SECTOR_LEN);
-
-			uint32_t fatDataOffset = fatTblOffset + (fat.totalFATs * fat.sectorsPerFAT * fat.bytesPerSector);
-			if (parts[0].type == PART_TYPE_FAT16) {
-				fatDataOffset += (fat.maxRootEntries * FAT_ENTRY_LEN) / fat.bytesPerSector;
-			}
-			io_read_sector(buffer, parts[0].start + (fatDataOffset / SECTOR_LEN));
-			debug_print_buffer(buffer, SECTOR_LEN);
+			fat_entry_t entry;
+			fat_read_entries(buffer, &parts[0], &fat, &entry);
 		}
 	}
 
