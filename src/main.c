@@ -52,6 +52,9 @@ char *part_type_desc[] = {
 
 #endif 
 
+#define SECONDS_PER_MINUTE 60
+#define SECONDS_PER_HOUR 3600
+#define SECONDS_PER_DAY 86400
 #define SECTOR_LEN 512
 #define PARTS_MAX 4
 #define PARTS_TBL_OFFSET 446
@@ -82,15 +85,24 @@ typedef struct {
 	uint16_t sectorsPerFAT; // 2
 } fat_t; // 14
 
+typedef struct __attribute__((__packed__)) {
+	uint8_t hour : 5;
+	uint8_t minute : 6;
+	uint8_t second : 5;
+	uint8_t year : 7;
+	uint8_t month : 4;
+	uint8_t day : 5;
+} fat_datetime_t; // 4 expected / 6 real // TODO
+
 typedef struct {
 	uint8_t name[8]; // 8
 	uint8_t ext[3]; // 3
 	uint8_t attr; // 1
-	uint32_t created; // 4
-	uint32_t changed; // 4
-	uint32_t cluster; // 2
+	fat_datetime_t created; // 4
+	fat_datetime_t changed; // 4
+	uint32_t cluster; // 4
 	uint32_t size; // 4
-} fat_entry_t; // 26
+} fat_entry_t; // 28
 
 error_t io_read_block(char *buffer, uint32_t offset, uint32_t len);
 error_t io_read_sector(char *buffer, uint32_t offset);
@@ -103,7 +115,16 @@ void debug_print_buffer(char *buffer, uint32_t len);
 void debug_print_part(part_t *part);
 void debug_print_fat(fat_t *fat);
 void debug_print_fat_entry(fat_entry_t *entry);
+void debug_print_fat_datetime(fat_datetime_t dt);
 
+/**
+ * Reads a block of data at the given offset of the given length into the 
+ * provided buffer. The buffer needs to be preallocated and big enought.
+ * @param buffer The byte buffer to read the block into.
+ * @param offset The offset of the block in bytes.
+ * @param len The length of the block in bytes.
+ * @return Whether the read operation was successful or an error occured.
+ */
 error_t io_read_block(char *buffer, uint32_t offset, uint32_t len) {
 	FILE *file;
 	file = fopen("512mb_kingston_sd.hex", "r");
@@ -113,7 +134,6 @@ error_t io_read_block(char *buffer, uint32_t offset, uint32_t len) {
 	if (fseek(file, offset, SEEK_SET) != 0) {
 		return E_ERROR;
 	}	
-	//printf("read_block fread: %d\n", fread(buffer, (size_t)len, 1, file));	
 	if (fread(buffer, (size_t)len, 1, file) != 1) {
 		return E_ERROR;
 	}
@@ -122,8 +142,38 @@ error_t io_read_block(char *buffer, uint32_t offset, uint32_t len) {
 	return E_SUCCESS;
 }
 
+/**
+ * Reads the sector at the given offset into the provided buffer. The buffer
+ * needs to be preallocated and big enought.
+ * @param buffer The byte buffer to read the sector into.
+ * @param offset The sector offset as the sector number, not bytes!
+ * @return Whether the read operation was successful or an error occured.
+ */
 error_t io_read_sector(char *buffer, uint32_t offset) {
 	return io_read_block(buffer, offset * SECTOR_LEN, SECTOR_LEN);
+}
+
+/** 
+ * Parsing a FAT datetime from the given buffer at the given offset.
+ * @param buffer The byte buffer with the datetime.
+ * @param offset The offset inside the given buffer.
+ * @return The parsed and filled FAT datetime.
+ */
+fat_datetime_t io_parse_fat_datetime(char *buffer, uint16_t offset) {
+	fat_datetime_t value;
+	uint16_t tmp;
+
+	tmp = io_parse_uint16(buffer, offset);
+	value.hour = tmp >> 11 & 0x1F;
+	value.minute = tmp >> 5 & 0x3F;
+	value.second = tmp & 0x1F;
+
+	tmp = io_parse_uint16(buffer, offset + 2);
+	value.year = tmp >> 9 & 0x7F;
+	value.month = tmp >> 5 & 0x0F;
+	value.day = tmp & 0x1F;
+
+	return value;
 }
 
 /** 
@@ -150,6 +200,13 @@ uint32_t io_parse_uint32(char *buffer, uint16_t offset) {
 		(buffer[offset + 0] & 0xff));
 }
 
+/**
+ * Parses the MBR from the given buffer and outputs all primary partitions. 
+ * The provided partition array needs to be preallocated and large enought.
+ * @param buffer The byte buffer with the MBR raw data in it.
+ * @param parts The array of primary partitions which gets filled.
+ * @return Whether parsing the MBR was successful or an error occured.
+ */
 error_t mbr_parse(char *buffer, part_t parts[]) {
 	uint8_t i = 0;
 	uint16_t offset;
@@ -204,6 +261,7 @@ error_t fat_read_entries(char *buffer, part_t *part, fat_t *fat, fat_entry_t *en
 	uint8_t i, j;
 	uint32_t offset = 0;
 	uint16_t bufferOffset;
+	uint32_t datetime;
 	bool terminate = false;
 	do {
 		io_read_sector(buffer, part->start + ((fatDataOffset + offset) / SECTOR_LEN));
@@ -223,12 +281,19 @@ error_t fat_read_entries(char *buffer, part_t *part, fat_t *fat, fat_entry_t *en
 				continue;
 			}
 
+			// Read entry values
 			for (j = 0; j < FAT_ENTRY_NAME_LEN; ++j) {
 				entry->name[j] = buffer[bufferOffset + 0x00 + j];
 			}
 			for (j = 0; j < FAT_ENTRY_EXT_LEN; ++j) {
 				entry->ext[j] = buffer[bufferOffset + 0x08 + j];	
 			}
+			entry->attr = buffer[bufferOffset + 0x0B];
+			entry->cluster = io_parse_uint16(buffer, bufferOffset + 0x1A) |
+				(io_parse_uint16(buffer, bufferOffset + 0x14) << 16);
+			entry->size = io_parse_uint32(buffer, bufferOffset + 0x1C);
+			entry->created = io_parse_fat_datetime(buffer, bufferOffset + 0x0E);
+			entry->changed = io_parse_fat_datetime(buffer, bufferOffset + 0x16);
 
 			bufferOffset += FAT_ENTRY_LEN;
 
@@ -282,7 +347,28 @@ void debug_print_fat_entry(fat_entry_t *entry) {
 	for (i = 0; i < FAT_ENTRY_EXT_LEN; ++i) {
 		putchar(entry->ext[i]);
 	}
-	putchar('\n');
+	printf(" | ");
+
+	printf("Attr: %#02x | ", entry->attr);
+	printf("Cluster: %#08x | ", entry->cluster);
+	printf("Size: %ld\n", entry->size);
+
+	printf("Created: ");
+	debug_print_fat_datetime(entry->created);
+	printf(" | ");
+	printf("Changed: ");
+	debug_print_fat_datetime(entry->changed);
+	printf("\n");
+}
+
+void debug_print_fat_datetime(fat_datetime_t dt) {
+	printf("%02d.%02d.%04d %02d:%02d:%02d",
+		dt.day & 0x1F,
+		dt.month & 0x0F,
+		(dt.year & 0x7F) + 1980,
+		dt.hour & 0x1F, 
+		dt.minute & 0x3F,
+		(dt.second & 0x1F) * 2);
 }
 
 int main(void) {	
@@ -304,13 +390,6 @@ int main(void) {
 			fat_read_entries(buffer, &parts[0], &fat, &entry);
 		}
 	}
-
-	/*printf("bool: %d\n", sizeof(bool));
-	printf("char: %d\n", sizeof(char));
-	printf("short: %d\n", sizeof(short));
-	printf("int: %d\n", sizeof(int));
-	printf("long: %d\n", sizeof(long));
-	printf("long long: %d\n", sizeof(long long));*/
 
 	return EXIT_SUCCESS;	
 }
